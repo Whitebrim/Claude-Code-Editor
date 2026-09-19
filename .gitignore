@@ -1,0 +1,15 @@
+# Rust build artefacts
+/target/
+
+# Editor / IDE
+/.idea/
+/.vscode/
+*.swp
+*~
+.DS_Store
+
+# Log / crash files from launching the app
+*.log
+
+# Local user state
+window.json
