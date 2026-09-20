@@ -61,6 +61,7 @@ struct ConversationInfo {
 
 struct App {
     projects_root: PathBuf,
+    files_signature: u64,
     conversations: Vec<ConversationInfo>,
     selected_idx: Option<usize>,
     search: String,
@@ -150,6 +151,7 @@ impl Default for App {
         let projects_root = default_projects_root();
         let mut app = Self {
             projects_root: projects_root.clone(),
+            files_signature: 0,
             conversations: Vec::new(),
             selected_idx: None,
             search: String::new(),
@@ -277,6 +279,57 @@ fn truncate_chars(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     out.push_str("...");
     out
+}
+
+// Cheap poll: hash the set of (.jsonl path, mtime) tuples under `root`
+// without opening any file. Used to decide whether the full parsing pass in
+// scan_conversations() is worth running each second.
+fn compute_files_signature(root: &Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn collect_jsonl(dir: &Path, out: &mut Vec<(String, u128)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            if let Some(s) = p.to_str() {
+                out.push((s.to_string(), mtime));
+            }
+        }
+    }
+
+    let mut entries: Vec<(String, u128)> = Vec::new();
+    let Ok(top) = fs::read_dir(root) else {
+        return 0;
+    };
+    let mut had_subdir = false;
+    for entry in top.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            had_subdir = true;
+            collect_jsonl(&path, &mut entries);
+        }
+    }
+    if !had_subdir {
+        collect_jsonl(root, &mut entries);
+    }
+    entries.sort();
+
+    let mut hasher = DefaultHasher::new();
+    entries.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn scan_conversations(root: &Path) -> Vec<ConversationInfo> {
@@ -450,6 +503,7 @@ fn scan_project_dir(dir: &Path, project: &str, results: &mut Vec<ConversationInf
 impl App {
     fn rescan(&mut self) {
         self.conversations = scan_conversations(&self.projects_root);
+        self.files_signature = compute_files_signature(&self.projects_root);
         let mut projects = std::collections::HashSet::new();
         for c in &self.conversations {
             projects.insert(&c.project);
@@ -575,26 +629,23 @@ impl App {
     }
 
     fn rescan_if_changed(&mut self) {
-        let fresh = scan_conversations(&self.projects_root);
-        let same = fresh.len() == self.conversations.len()
-            && fresh
-                .iter()
-                .zip(self.conversations.iter())
-                .all(|(a, b)| {
-                    a.filename == b.filename
-                        && a.modified == b.modified
-                        && a.message_count == b.message_count
-                        && a.is_rewind == b.is_rewind
-                });
-        if !same {
-            let previously_selected = self
-                .selected_idx
-                .and_then(|i| self.conversations.get(i).map(|c| c.filename.clone()));
-            self.conversations = fresh;
-            self.selected_idx = previously_selected.and_then(|name| {
-                self.conversations.iter().position(|c| c.filename == name)
-            });
+        // Cheap signature scan: enumerate every .jsonl and hash its
+        // (path, mtime) tuples. Reading file contents happens only when the
+        // signature differs from the previous poll — otherwise the 1-second
+        // heartbeat costs one readdir per project instead of a full parse.
+        let sig = compute_files_signature(&self.projects_root);
+        if sig == self.files_signature {
+            return;
         }
+        self.files_signature = sig;
+
+        let fresh = scan_conversations(&self.projects_root);
+        let previously_selected = self
+            .selected_idx
+            .and_then(|i| self.conversations.get(i).map(|c| c.filename.clone()));
+        self.conversations = fresh;
+        self.selected_idx = previously_selected
+            .and_then(|name| self.conversations.iter().position(|c| c.filename == name));
     }
 
     fn commit_edit(&mut self, msg_idx: usize) {
